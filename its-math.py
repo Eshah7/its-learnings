@@ -781,12 +781,17 @@ def _(METRICS, mo, nwsl_ts):
         _search = _auto_arima(
             _pre,
             seasonal=False,
-            stepwise=True,
-            information_criterion="aic",
+            stepwise=False,          # exhaustive search, not stepwise
+            information_criterion="aicc",  # corrected AIC for small n (~44 obs)
+            max_p=4, max_q=2,
             suppress_warnings=True,
             error_action="ignore",
         )
         _p, _d, _q = _search.order
+        # Fallback: (0,0,0) is a white-noise model — if ACF shows persistence,
+        # force AR(1) rather than pretending observations are independent.
+        if (_p, _d, _q) == (0, 0, 0):
+            _p = 1
         arima_orders[_metric] = (_p, _d, _q)
 
         # Stage 2: refit full series with intervention exogenous variables
