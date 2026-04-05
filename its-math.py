@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.22.0"
+__generated_with = "0.22.4"
 app = marimo.App(width="full")
 
 
@@ -53,7 +53,7 @@ def _():
     import matplotlib.gridspec as gridspec
     from matplotlib.lines import Line2D
 
-    return pd, plt
+    return np, pd, plt
 
 
 @app.cell
@@ -326,57 +326,40 @@ def _(mo):
 
 
 @app.cell
-def _(nwsl_matches, nwsl_pk, pd, wsl_matches):
-    # Align game_id types before merging (CSV load may cast differently)
-    _nwsl = nwsl_matches.drop(columns=["total_pks"], errors="ignore").copy()
-    _nwsl["game_id"] = _nwsl["game_id"].astype(str)
-    _pk = nwsl_pk.copy()
-    _pk.columns = ["game_id", "total_pks"]  # force by position — avoids name ambiguity
-    _pk["game_id"] = _pk["game_id"].astype(str)
-    _nwsl = _nwsl.merge(_pk, on="game_id", how="left")
-    _nwsl["total_pks"] = _nwsl["total_pks"].fillna(0)
-
-    # WSL has no PK data from the penalties cell — fill with NaN so it's
-    # excluded from the WSL time series aggregation rather than counted as 0
-    _wsl = wsl_matches.copy()
-    if "total_pks" not in _wsl.columns:
-        _wsl["total_pks"] = float("nan")
+def _(nwsl_matches, nwsl_pk, wsl_matches):
+    # Merge penalty counts into nwsl_matches before aggregating
+    _nwsl = nwsl_matches.merge(nwsl_pk, on="game_id", how="left")
+    # Ensure total_pks exists (may not if nwsl_pk wasn't fetched or matched)
+    if "total_pks" not in _nwsl.columns:
+        _nwsl["total_pks"] = 0.0
+    else:
+        _nwsl["total_pks"] = _nwsl["total_pks"].fillna(0)
 
     def _make_ts(match_df, league_name):
-        _stat_map = {
-            "total_fouls":   "fouls_per_game",
-            "total_yellows": "yellows_per_game",
-            "total_reds":    "reds_per_game",
-            "total_pks":     "pks_per_game",
-        }
-        # Only include columns that exist and have at least some non-NaN data
-        _agg = {
-            out: pd.NamedAgg(src, "mean")
-            for src, out in _stat_map.items()
-            if src in match_df.columns and match_df[src].notna().any()
-        }
         ts = (
             match_df.groupby(["season", "matchweek"])
-            .agg(n_matches=pd.NamedAgg("season", "count"), **_agg)
+            .agg(
+                fouls_per_game=("total_fouls", "mean"),
+                yellows_per_game=("total_yellows", "mean"),
+                reds_per_game=("total_reds", "mean"),
+                pks_per_game=("total_pks", "mean"),
+                n_matches=("total_fouls", "count"),
+            )
             .reset_index()
             .sort_values(["season", "matchweek"])
             .reset_index(drop=True)
         )
-        # Ensure all standard columns exist (fill NaN if not available for this league)
-        for col in ["fouls_per_game", "yellows_per_game", "reds_per_game", "pks_per_game"]:
-            if col not in ts.columns:
-                ts[col] = float("nan")
         ts["t"] = range(len(ts))
         ts["league"] = league_name
         return ts
 
     nwsl_ts = _make_ts(_nwsl, "NWSL")
-    wsl_ts = _make_ts(_wsl, "WSL")
+    wsl_ts = _make_ts(wsl_matches, "WSL")
 
     print(f"NWSL time series: {len(nwsl_ts)} matchweeks")
     print(f"WSL time series:  {len(wsl_ts)} matchweeks")
     nwsl_ts[["season", "matchweek", "t", "fouls_per_game"]].head(8)
-    return (nwsl_ts,)
+    return nwsl_ts, wsl_ts
 
 
 @app.cell
@@ -979,7 +962,7 @@ def _(mo):
 
 
 @app.cell
-def _(intervention_t, mo, nwsl_ts, wsl_ts):
+def _(intervention_t, mo, np, nwsl_ts, wsl_ts):
     try:
         from causalimpact import CausalImpact
         _ci_available = True
@@ -1021,6 +1004,16 @@ def _(intervention_t, mo, nwsl_ts, wsl_ts):
             # Fouls: NWSL-only
             _ci_df = nwsl_ts[[_metric]].copy()
             _ci_df.index = nwsl_ts["t"].values
+
+        # Validate that response has variation and no NaN
+        _response = _ci_df.iloc[:, 0]
+        _nan_count = _response.isna().sum()
+        _var = _response.var()
+
+        if _nan_count > 0 or _var == 0 or (isinstance(_var, float) and np.isnan(_var)):
+            print(f"⚠ {_label}: Skipped (insufficient variation or all NaN). "
+                  f"NaN: {_nan_count}, Variance: {_var}")
+            continue
 
         _t_vals = sorted(_ci_df.index.tolist())
         _split = max(t for t in _t_vals if t < intervention_t)
